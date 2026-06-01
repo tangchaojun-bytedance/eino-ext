@@ -18,13 +18,156 @@ package agenticclaude
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
+	"io"
+	"math/big"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
 	"github.com/eino-contrib/jsonschema"
 )
+
+const testBedrockModel = "anthropic.claude-3-haiku-20240307-v1:0"
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func testBedrockResponse(req *http.Request) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body: io.NopCloser(strings.NewReader(`{
+			"id": "msg_test",
+			"type": "message",
+			"role": "assistant",
+			"model": "anthropic.claude-3-haiku-20240307-v1:0",
+			"content": [{"type": "text", "text": "bedrock ok"}],
+			"stop_reason": "end_turn",
+			"stop_sequence": null,
+			"usage": {"input_tokens": 1, "output_tokens": 1}
+		}`)),
+		Request: req,
+	}
+}
+
+func writeTestCABundle(t *testing.T) string {
+	t.Helper()
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+
+	now := time.Now()
+	cert := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, cert, cert, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "ca.pem")
+	if err = os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600); err != nil {
+		t.Fatalf("write CA bundle: %v", err)
+	}
+
+	return path
+}
+
+func TestBedrockHTTPClientUsedForRequests(t *testing.T) {
+	called := false
+	httpClient := &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			called = true
+
+			if req.URL.Host != "bedrock-runtime.us-east-1.amazonaws.com" {
+				t.Fatalf("request host = %q, want bedrock-runtime.us-east-1.amazonaws.com", req.URL.Host)
+			}
+			if !strings.Contains(req.URL.Path, "/model/"+testBedrockModel+"/invoke") {
+				t.Fatalf("request path = %q, want Bedrock invoke path", req.URL.Path)
+			}
+
+			body, err := io.ReadAll(req.Body)
+			if err != nil {
+				t.Fatalf("read request body: %v", err)
+			}
+			if !strings.Contains(string(body), `"anthropic_version"`) {
+				t.Fatalf("request body does not contain anthropic_version: %s", body)
+			}
+			if strings.Contains(string(body), `"model"`) {
+				t.Fatalf("request body still contains model after Bedrock rewrite: %s", body)
+			}
+
+			return testBedrockResponse(req), nil
+		}),
+	}
+
+	m, err := New(context.Background(), &Config{
+		ByBedrock: &BedrockConfig{
+			Region:          "us-east-1",
+			AccessKey:       "test-access-key",
+			SecretAccessKey: "test-secret-key",
+		},
+		Model:      testBedrockModel,
+		MaxTokens:  16,
+		HTTPClient: httpClient,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	msg, err := m.Generate(context.Background(), []*schema.AgenticMessage{schema.UserAgenticMessage("hello")})
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	if !called {
+		t.Fatalf("custom HTTP client was not used")
+	}
+	if len(msg.ContentBlocks) != 1 || msg.ContentBlocks[0].AssistantGenText == nil ||
+		msg.ContentBlocks[0].AssistantGenText.Text != "bedrock ok" {
+		t.Fatalf("Generate() message = %#v, want text block %q", msg, "bedrock ok")
+	}
+}
+
+func TestBedrockPlainHTTPClientWithAWSCA_BUNDLE(t *testing.T) {
+	t.Setenv("AWS_CA_BUNDLE", writeTestCABundle(t))
+
+	m, err := New(context.Background(), &Config{
+		ByBedrock: &BedrockConfig{
+			Region:          "us-east-1",
+			AccessKey:       "test-access-key",
+			SecretAccessKey: "test-secret-key",
+		},
+		Model:      testBedrockModel,
+		MaxTokens:  16,
+		HTTPClient: &http.Client{},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if m == nil {
+		t.Fatalf("New() returned nil model")
+	}
+}
 
 func TestGetAllowedToolNames(t *testing.T) {
 	t.Run("deduplicate function and server tools", func(t *testing.T) {

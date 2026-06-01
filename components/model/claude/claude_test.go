@@ -18,9 +18,19 @@ package claude
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
+	"io"
+	"math/big"
+	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/packages/param"
@@ -33,6 +43,63 @@ import (
 
 	"github.com/cloudwego/eino/schema"
 )
+
+const testBedrockModel = "anthropic.claude-3-haiku-20240307-v1:0"
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func testBedrockResponse(req *http.Request) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body: io.NopCloser(strings.NewReader(`{
+			"id": "msg_test",
+			"type": "message",
+			"role": "assistant",
+			"model": "anthropic.claude-3-haiku-20240307-v1:0",
+			"content": [{"type": "text", "text": "bedrock ok"}],
+			"stop_reason": "end_turn",
+			"stop_sequence": null,
+			"usage": {"input_tokens": 1, "output_tokens": 1}
+		}`)),
+		Request: req,
+	}
+}
+
+func writeTestCABundle(t *testing.T) string {
+	t.Helper()
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+
+	now := time.Now()
+	cert := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, cert, cert, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "ca.pem")
+	err = os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o600)
+	if err != nil {
+		t.Fatalf("write CA bundle: %v", err)
+	}
+
+	return path
+}
 
 func TestDirectAnthropicAuthSelection(t *testing.T) {
 	t.Run("config auth exists", func(t *testing.T) {
@@ -60,6 +127,60 @@ func TestDirectAnthropicAuthSelection(t *testing.T) {
 		assert.NoError(t, err)
 		assert.NotNil(t, model)
 	})
+}
+
+func TestBedrockHTTPClientUsedForRequests(t *testing.T) {
+	clearAnthropicAuthEnv(t)
+
+	called := false
+	httpClient := &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			called = true
+
+			assert.Equal(t, "bedrock-runtime.us-east-1.amazonaws.com", req.URL.Host)
+			assert.Contains(t, req.URL.Path, "/model/"+testBedrockModel+"/invoke")
+
+			body, err := io.ReadAll(req.Body)
+			assert.NoError(t, err)
+			assert.Contains(t, string(body), `"anthropic_version"`)
+			assert.NotContains(t, string(body), `"model"`)
+
+			return testBedrockResponse(req), nil
+		}),
+	}
+
+	cm, err := NewChatModel(context.Background(), &Config{
+		ByBedrock:       true,
+		Region:          "us-east-1",
+		AccessKey:       "test-access-key",
+		SecretAccessKey: "test-secret-key",
+		Model:           testBedrockModel,
+		MaxTokens:       16,
+		HTTPClient:      httpClient,
+	})
+	assert.NoError(t, err)
+
+	msg, err := cm.Generate(context.Background(), []*schema.Message{schema.UserMessage("hello")})
+	assert.NoError(t, err)
+	assert.True(t, called)
+	assert.Equal(t, "bedrock ok", msg.Content)
+}
+
+func TestBedrockPlainHTTPClientWithAWSCA_BUNDLE(t *testing.T) {
+	clearAnthropicAuthEnv(t)
+	t.Setenv("AWS_CA_BUNDLE", writeTestCABundle(t))
+
+	cm, err := NewChatModel(context.Background(), &Config{
+		ByBedrock:       true,
+		Region:          "us-east-1",
+		AccessKey:       "test-access-key",
+		SecretAccessKey: "test-secret-key",
+		Model:           testBedrockModel,
+		MaxTokens:       16,
+		HTTPClient:      &http.Client{},
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, cm)
 }
 
 func TestClaude(t *testing.T) {

@@ -97,10 +97,16 @@ func NewChatModel(ctx context.Context, config *Config) (*ChatModel, error) {
 			opts = append(opts, awsConfig.WithSharedConfigProfile(config.Profile))
 		}
 
-		if config.HTTPClient != nil {
-			opts = append(opts, awsConfig.WithHTTPClient(config.HTTPClient))
+		cfg, err := awsConfig.LoadDefaultConfig(ctx, opts...)
+		if err != nil {
+			return nil, fmt.Errorf("load AWS config for Bedrock: %w", err)
 		}
-		cli = anthropic.NewClient(bedrock.WithLoadDefaultConfig(ctx, opts...))
+
+		clientOpts := []option.RequestOption{bedrock.WithConfig(cfg)}
+		if config.HTTPClient != nil {
+			clientOpts = append(clientOpts, option.WithHTTPClient(config.HTTPClient))
+		}
+		cli = anthropic.NewClient(clientOpts...)
 	} else {
 		// Use direct Anthropic API
 		var opts []option.RequestOption

@@ -264,11 +264,17 @@ func newClient(ctx context.Context, cfg *Config) (anthropic.Client, error) {
 		} else if cfg.ByBedrock.Profile != "" {
 			opts = append(opts, config.WithSharedConfigProfile(cfg.ByBedrock.Profile))
 		}
-		if cfg.HTTPClient != nil {
-			opts = append(opts, config.WithHTTPClient(cfg.HTTPClient))
+		awsCfg, err := config.LoadDefaultConfig(ctx, opts...)
+		if err != nil {
+			return anthropic.Client{}, fmt.Errorf("load AWS config for Bedrock: %w", err)
 		}
 
-		return anthropic.NewClient(bedrock.WithLoadDefaultConfig(ctx, opts...)), nil
+		clientOpts := []option.RequestOption{bedrock.WithConfig(awsCfg)}
+		if cfg.HTTPClient != nil {
+			clientOpts = append(clientOpts, option.WithHTTPClient(cfg.HTTPClient))
+		}
+
+		return anthropic.NewClient(clientOpts...), nil
 
 	default:
 		var opts []option.RequestOption
